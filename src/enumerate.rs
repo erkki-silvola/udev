@@ -5,11 +5,10 @@
 //!
 //! From [`libudev-enumerate`](https://github.com/eudev-project/eudev/blob/master/src/libudev/libudev-enumerate.c) documentation.
 
+use std::io::ErrorKind;
 use std::{fs, sync::Arc};
 
-use crate::util;
-use crate::UDEV_ROOT_RUN;
-use crate::{Error, Result, Udev, UdevDevice, UdevEntry, UdevEntryList, UdevList};
+use crate::{Error, Result, Udev, UdevDevice, UdevEntry, UdevEntryList, UdevList, UDEV_ROOT_RUN};
 
 const LOG_PREFIX: &str = "udev enumerate:";
 
@@ -705,16 +704,21 @@ impl UdevEnumerate {
     }
 
     fn match_sysattr(&self, dev: &mut UdevDevice) -> bool {
-        !self
+        if self
             .sysattr_nomatch_list
             .iter()
             .any(|f| dev.match_sysattr_value(f.name(), f.value()))
-            && self
-                .sysattr_match_list
-                .iter()
-                .filter(|f| !dev.match_sysattr_value(f.name(), f.value()))
-                .count()
-                == 0
+        {
+            return false;
+        }
+        if self.sysattr_match_list.is_empty() {
+            return true;
+        }
+        self.sysattr_match_list
+            .iter()
+            .filter(|f| !dev.match_sysattr_value(f.name(), f.value()))
+            .count()
+            == 0
             && self
                 .sysattr_match_list
                 .iter()
@@ -725,8 +729,123 @@ impl UdevEnumerate {
         Err(Error::UdevEnumerate("unimplemented".into()))
     }
 
+    /// Enumerate one level under `/sys/{basedir}`, optionally appending `instance/subdir`
+    /// for each entry, and filter top-level names with [`match_subsystem`](Self::match_subsystem).
+    ///
+    /// Matches `enumerator_scan_dir()` in systemd's `device-enumerator.c`.
+    fn scan_sysfs_enumerate_dir(
+        &mut self,
+        basedir: &str,
+        inner_subdir: Option<&str>,
+        subsystem_override: Option<&str>,
+    ) -> Result<()> {
+        let path = format!("/sys/{basedir}");
+        let read_dir = match fs::read_dir(path.as_str()) {
+            Ok(rd) => rd,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(Error::UdevEnumerate(format!(
+                    "unable to open {path} path: {err}"
+                )));
+            }
+        };
+
+        for dir_entry in read_dir.filter(|e| e.is_ok()) {
+            let dir_entry = dir_entry?;
+            let ft = match dir_entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if !ft.is_dir() && !ft.is_symlink() {
+                continue;
+            }
+
+            let d_name = dir_entry
+                .file_name()
+                .into_string()
+                .unwrap_or(String::new());
+
+            if d_name.is_empty() {
+                log::trace!("{LOG_PREFIX} empty/invalid entry");
+            } else if d_name.starts_with('.') {
+                log::trace!("{LOG_PREFIX} private entry");
+            } else {
+                let subsystem = subsystem_override.unwrap_or(d_name.as_str());
+                if !self.match_subsystem(subsystem) {
+                    continue;
+                }
+                match inner_subdir {
+                    Some(sub) => self.scan_dir_and_add_devices(basedir, &d_name, sub)?,
+                    None => self.scan_dir_and_add_devices(basedir, &d_name, "")?,
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn scan_devices_all(&mut self) -> Result<()> {
-        Err(Error::UdevEnumerate("unimplemented".into()))
+        // Same as `enumerator_scan_devices_all()` in systemd `device-enumerator.c`:
+        // scan `/sys/bus/*/devices` and `/sys/class/*`.
+        let mut ret = Ok(());
+        if let Err(e) = self.scan_sysfs_enumerate_dir("bus", Some("devices"), None) {
+            log::trace!("{LOG_PREFIX} failed to scan /sys/bus: {e}");
+            ret = Err(e);
+        }
+        if let Err(e) = self.scan_sysfs_enumerate_dir("class", None, None) {
+            log::trace!("{LOG_PREFIX} failed to scan /sys/class: {e}");
+            ret = Err(e);
+        }
+        ret
+    }
+
+    fn syspath_list_contains(&self, syspath: &str) -> bool {
+        self.devices.iter().any(|e| e.syspath() == syspath)
+    }
+
+    /// Add ancestors that match filters, like `enumerator_add_parent_devices()` in systemd.
+    fn add_matching_ancestors(&mut self, mut dev: UdevDevice) -> Result<()> {
+        loop {
+            dev = match dev.new_from_parent() {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+
+            if !self.match_sysname(dev.sysname()) {
+                continue;
+            }
+            if !self.match_subsystem(dev.subsystem()) {
+                continue;
+            }
+            if self.match_is_initialized {
+                if !dev.get_is_initialized() {
+                    if dev.devnum() != 0 || dev.get_ifindex() > 0 {
+                        continue;
+                    }
+                }
+            }
+            if !self.match_parent(&dev) {
+                continue;
+            }
+            if !self.match_tag(&mut dev) {
+                continue;
+            }
+            if !self.match_property(&dev) {
+                continue;
+            }
+            if !self.match_sysattr(&mut dev) {
+                continue;
+            }
+
+            let p_syspath = dev.syspath().to_owned();
+            if self.syspath_list_contains(p_syspath.as_str()) {
+                break;
+            }
+
+            self.syspath_add(p_syspath.as_str())?;
+        }
+
+        Ok(())
     }
 
     /// Scans `/sys` for all kernel subsystems.
@@ -779,12 +898,27 @@ impl UdevEnumerate {
             format!("/sys/{basedir}")
         };
 
-        let mut add_syspaths: Vec<String> = Vec::new();
+        let read_dir = match fs::read_dir(path.as_str()) {
+            Ok(rd) => rd,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(Error::UdevEnumerate(format!(
+                    "unable to open {path} path: {err}"
+                )));
+            }
+        };
 
-        for dir_entry in fs::read_dir(path.as_str())
-            .map_err(|err| Error::UdevEnumerate(format!("unable to open {path} path: {err}")))?
-        {
-            let d_name = dir_entry?
+        for dir_entry in read_dir.filter(|e| e.is_ok()) {
+            let dir_entry = dir_entry?;
+            let ft = match dir_entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if !ft.is_dir() && !ft.is_symlink() {
+                continue;
+            }
+
+            let d_name = dir_entry
                 .file_name()
                 .into_string()
                 .unwrap_or(String::new());
@@ -813,34 +947,38 @@ impl UdevEnumerate {
                         // might not store a database, and have no way to find out
                         // for all other types of devices.
                         // ```
-                        if dev.get_is_initialized()
-                            && (util::major(dev.devnum()) > 0 || dev.get_ifindex() > 0)
-                        {
-                            break;
+                        if !dev.get_is_initialized() {
+                            if dev.devnum() != 0 || dev.get_ifindex() > 0 {
+                                log::trace!("{LOG_PREFIX} device not initialized (devnode/ifindex)");
+                                continue;
+                            }
                         }
+                    }
+                    if !self.match_subsystem(dev.subsystem()) {
+                        log::trace!("{LOG_PREFIX} no subsystem match");
+                        continue;
                     }
                     let dev_syspath = dev.syspath().to_owned();
                     if !self.match_parent(&dev) {
                         log::trace!("{LOG_PREFIX} no parent match");
-                        break;
+                        continue;
                     } else if !self.match_tag(&mut dev) {
                         log::trace!("{LOG_PREFIX} no tag match");
-                        break;
+                        continue;
                     } else if !self.match_property(&dev) {
                         log::trace!("{LOG_PREFIX} no property match");
-                        break;
+                        continue;
                     } else if !self.match_sysattr(&mut dev) {
                         log::trace!("{LOG_PREFIX} no /sys attribute match");
-                        break;
+                        continue;
+                    } else if self.syspath_list_contains(dev_syspath.as_str()) {
+                        continue;
                     } else {
-                        add_syspaths.push(dev_syspath);
+                        self.syspath_add(dev_syspath.as_str())?;
+                        self.add_matching_ancestors(dev)?;
                     }
                 }
             }
-        }
-
-        for syspath in add_syspaths.iter() {
-            self.add_syspath(syspath)?;
         }
 
         Ok(())
